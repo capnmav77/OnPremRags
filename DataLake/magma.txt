@@ -1,0 +1,273 @@
+ABSTRACT
+We present Magma, a write-optimized high data density key-value
+storage engine used in the Couchbase NoSQL distributed docu-
+ment database. Today’s write-heavy data-intensive applications
+like ad-serving, internet-of-things, messaging, and online gaming,
+generate massive amounts of data. As a result, the requirement
+for storing and retrieving large volumes of data has grown rapidly.
+Distributed databases that can scale out horizontally by adding
+more nodes can be used to serve the requirements of these internet-
+scale applications. To maintain a reasonable cost of ownership, we
+need to improve storage eciency in handling large data volumes
+per node, such that we don’t have to rely on adding more nodes.
+Our current generation storage engine, Couchstore is based on a
+log-structured append-only copy-on-write B+Tree architecture. To
+make substantial improvements to support higher data density and
+write throughput, we needed a storage engine architecture that
+lowers write amplication and avoids compaction operations that
+rewrite the whole database les periodically.
+We introduce Magma, a hybrid key-value storage engine that
+combines LSM Trees and a segmented log approach from log-
+structured le systems. We present a novel approach to perform-
+ing garbage collection of stale document versions avoiding index
+lookup during log segment compaction. This is the key to achieving
+storage eciency for Magma and eliminates the need for random
+I/Os during compaction. Magma oers signicantly lower write
+amplication, scalable incremental compaction, and lower space
+amplication while not regressing the read amplication. Through
+the eciency improvements, we improved the single machine data
+density supported by the Couchbase Server by 3.3x and lowered
+the memory requirement by 10x, thereby reducing the total cost
+of ownership up to 10x. Our evaluation results show that Magma
+outperforms Couchstore and RocksDB in write-heavy workloads.
+PVLDB Reference Format:
+Sarath Lakshman, Apaar Gupta, Rohan Suri, Scott Lashley, John Liang,
+Srinath Duvuru, and Ravi Mayuram. Magma: A High Data Density Storage
+Engine Used in Couchbase. PVLDB, 15(12): 3496-3508, 2022.
+doi:10.14778/3554821.3554839
+1 INTRODUCTION
+Modern-day internet-scale interactive applications generate huge
+amounts of data through user engagements. These data-intensive
+applications like ad-serving, internet-of-things, messaging, and on-
+line gaming are real-time and write-heavy, requiring large storage
+capacity and high transaction throughput. As a result, distributed
+databases that can scale horizontally have become an integral part
+of the modern data infrastructure stack that needs to operate at
+scale. The rapid growth of data volumes due to the digital wave
+has introduced challenges from a manageability and storage cost
+perspective. These problems have only grown despite the cost of
+computing and storage hardware like memory and ash dropping
+because the cost reduction has not kept up with the growth of
+data. The high throughput and storage capacity can be achieved
+by scaling out the distributed database by adding more nodes. To
+maintain a reasonable cost of ownership, we need to improve stor-
+age eciency in handling large data volumes per node, such that
+we don’t have to rely on adding more nodes.
+Under the hood, a single node of the distributed database depends
+on a persistent key-value storage engine for durable storage and
+retrieval of the database records. B+Trees [7] and Log structured
+merge trees [26] are two popular access methods for implementing
+persistent key-value storage engines. B+Tree is a read-optimized
+data structure while LSM Tree is write-optimized. Both of these
+data structures can be found in popular distributed databases like
+Couchbase, Cassandra, MongoDB, CockroachDB, etc. The eciency
+and performance of I/O intensive index structures are essentially a
+balance among three properties. Write amplication, read ampli-
+cation, and space amplication (RUM Conjecture) [4]. We cannot
+achieve write-optimized, read-optimized, and space-optimized per-
+sistent index structures all at the same time. Write amplication
+denes the ratio of the amount of data written to disk for every byte
+of write to the storage engine. Read amplication is the number
+of reads issued to the disk for every read operation of the storage
+engine. Space amplication is the ratio of the amount of data stored
+on a disk to the user input data size.
+Key Challenges with High Data Density. We start by identify-
+ing the challenges faced by our append-only copy-on-write B+Tree
+based storage engine to sustain high write throughput with a large
+volume of data per node with a database size to memory ratio of
+100x.
+Slow Writes. Updates in a copy-on-write B+Tree are done as
+read-modify-write, requiring random read I/Os. As the density
+increases, reads incur large cache misses for the B+Tree pages.
+Keys are spread out in a large key range distribution, and hence
+larger B+Tree. The opportunity for deduplication before writing
+and amortization of page rewrites due to large batches reduces,
+thereby increasing the write amplication. Write latency increases
+and throughput drops.
+Compaction Challenges. When the database becomes frag-
+mented, a compaction operation needs to be performed to limit
+space amplication. Compaction performs a full database rewrite
+This work is licensed under the Creative Commons BY-NC-ND 4.0 International
+License. Visit https://creativecommons.org/licenses/by-nc-nd/4.0/ to view a copy of
+this license. For any use beyond those covered by this license, obtain permission by
+emailing info@vldb.org. Copyright is held by the owner/author(s). Publication rights
+licensed to the VLDB Endowment.
+Proceedings of the VLDB Endowment, Vol. 15, No. 12 ISSN 2150-8097.
+doi:10.14778/3554821.3554839
+3496
+by copying live documents to a new le and building the B+Tree
+indexes, taking time proportional to the database size. After copy-
+ing, it has to run catchup to replay the extra changes that came
+in during the copying. This introduces high write amplication.
+Writes can only run at the speed of single-threaded compaction
+per DB le. Even though we have several DB les per node, as the
+density increases, the size of individual les increases. Full DB le
+rewrite and longer duration catchup with larger DB size are no
+longer scalable.
+We present Magma, a hybrid write-optimized storage engine
+based on LSM Trees [26] and Log-structured storage [28] available
+in Couchbase 7.1. In this paper, we describe the following key
+contributions:
+• Evaluation of copy-on-write B+ tree for high data density
+• Design of a high data density storage engine that blends
+LSM Trees with Log-Structured storage to achieve low write
+amplication
+• A novel method for garbage collecting the log-structured
+storage eciently
+This paper is organized into three parts. We initially discuss the
+background by providing details on B+Trees in the context of chal-
+lenges faced by our existing storage engine Couchstore in Section
+2. Section 3 and 4 discuss the Magma design and our contributions.
+Section 9 provides experimental evaluation results and discussion.
+Couchbase distributed database has a microservices approach
+called multi-dimensional-scaling [6, 9] to horizontally scale all parts
+of the database. Data service is a distributed high-performance,
+replicated and elastic key-value document storage service that
+spans across several nodes as shown in Figure 1. In Couchbase
+Figure 2: Copy-on-write B+Tree undergoing a modication
+Couchstore [10] is the current generation storage engine of
+Couchbase Server for document storage. The overall architecture
+3497
+inherits from the storage model of Apache CouchDB [2]. This stor-
+age engine is battle-hardened in production and has been serving
+Couchbase customers for almost 10 years. Couchstore is based
+on copy-on-write (COW) B+Tree and it follows a log-structured
+append-only storage model. Each vBucket maintains a couchstore
+le and stores the documents belonging to the vBucket. The le
+format consists of documents and B+Tree pages interleaved in the
+le. Each couchstore le maintains three B+Trees, a byKey index
+for accessing by key, bySeqno index for accessing by seqno, and a
+metadata B+Tree for storing vBucket statistics and metadata. To
+look up a document by key, byKey B+Tree is used to obtain the
+le oset of the document version, and a read is performed from
+the oset. Couchstore does not have a dedicated managed cache.
+Rather it depends on the le system buer cache.
+A copy-on-write B+Tree is an adaptation of B+Tree for the log-
+structured storage model. Compared to update in-place B+trees, the
+COW B+Trees can achieve higher write throughput as it performs
+writes in a sequential access pattern. B+Tree consists of intermedi-
+ate pages and leaf pages. The leaf page consists of key-record pairs.
+Intermediate pages consist of key-value pairs with the value being
+the le osets of pointing pages within the same le.
+2.2.1 Write Operation. B+Tree modication involves a read-modify-
+write scheme for the B+Tree page. When a record needs to be added
+or removed to the COW B+Tree, it locates the leaf page where the
+record key belongs by traversing the tree from the root page and
+navigating through the intermediate pages. It makes a copy of the
+leaf page in memory and modies the page to add or remove the
+record. The new version of the page is appended to the DB le. Now
+that the location of the leaf page has changed to a new oset, we
+need to update the intermediate node that points to the leaf node.
+Similarly, all the intermediate pages up to the root page need to be
+rewritten to update the new page locations. As shown in Figure
+2, if a record is modied or added to page C3, it has to make the
+modication in C3 and create C3’. Similarly, the pointing parent
+pages including the intermediate page B2’ and new page A’ need
+to be written. The older version of the pages (C3, B2, A) becomes
+stale in the le as the current B+Tree points to the recently updated
+pages. In B+Trees, the unit of modication is a single page. Hence,
+even if a single record is added or removed, pages in the unit of
+disk block sizes need to be rewritten. Every leaf page modication
+results in multiple pages to be rewritten and this can lead to high
+write amplication.
+2.2.2 Read Operation. Read operation in a COW B+Tree is similar
+to a traditional B+Tree.
+2.2.3 Compaction Operations. Since we follow the append-only
+storage model for writes, every insert, update, and deletion opera-
+tion in the B+Tree results in multiple page rewrites. Each modica-
+tion operation generates a few new pages while making the older
+versions of the pages stale. These stale versions still are present
+in the DB le. As more data is written, the DB le grows in size.
+The B+Tree metadata maintains the size of the current live B+tree
+in the le. Once the stale data size grows above a fragmentation
+threshold compared to the DB le size, we perform compaction.
+A compaction operation runs in a background thread. It obtains
+the current B+Tree root oset and opens a B+Tree iterator. A new
+DB le is opened and it performs a B+Tree bulk load operation
+to the new le, rebuilding the B+Tree. While the compaction is
+running, the writes continue to operate on the DB le. The com-
+pactor operates on a point-in-time snapshot of the B+Tree. After
+nishing the B+Tree bulk load, it runs a catchup phase to replay
+the new additions/deletions that happened to the B+Tree from the
+point-in-time version used by the compactor up to the latest B+Tree
+in the DB le. On completion of the catchup phase, the old DB le
+is removed and writers and readers switch to the new DB le. The
+space is reclaimed. Compaction is a single-threaded process that
+runs on a DB le.
+2.3 Log-Structured Merge Tree
+Figure 3: LSM Tree architecture
+LSM Tree is a write-optimized persistent index data structure.
+LSM Trees achieve high write throughput by utilizing superior
+sequential write bandwidth of SSDs [18] and spinning disks com-
+pared to the random I/O access pattern. The large sequential writes
+are achieved by batching a large number of mutations in memory
+before writing the index structure. LSM Trees is a hierarchical data
+structure that consists of a memory component and multiple lev-
+els of persistent immutable index components. For the persistent
+components, it uses the append-only B+Tree index. The on-disk
+components are organized as levels with exponentially increasing
+sizes.
+2.3.1 Write Operation. All writes in an LSM Tree are buered
+in the in-memory component and they are also appended to a
+write-ahead log as shown in Figure 3. During crash recovery, the
+in-memory component can be recovered by sequentially scanning
+the write-ahead log. The in-memory component uses a sort ordered
+data structure providing fast lookups and range reads. Once the
+in-memory component reaches a threshold size limit, it is frozen
+and a new one is initialized for processing incoming writes. The
+records from the frozen in-memory component are converted into
+a B+Tree on a new le. This le is called a sorted strings table
+(SSTable).
+2.3.2 Compaction Operation. As the in-memory components are
+ushed to the disk, more SSTable les are generated. For performing
+a lookup, it has to search SSTables in the most recent table rst order
+until the key is found. The I/O and CPU cost becomes proportional
+3498
+to the number of tables to be evaluated. A large number of tables
+also consume space as they may contain stale key-value pairs. To
+minimize the cost of reads as well as reduce space usage, we have
+to periodically merge SSTable les and reclaim space. This process
+is called compaction.
+A level-based compaction strategy popularized by LevelDB [15,
+24] is a common compaction strategy for achieving lower read am-
+plication and space amplication. The LSM Tree is organized into
+multiple levels of exponentially increasing sizes with the smallest
+size at the top and the largest being the bottom level. Each level can
+have several SSTable les. The in-memory component is periodi-
+cally ushed into level-0 as an SSTable le. Level-0 is a special level
+that accumulates new data. It can have multiple SSTables with over-
+lapping key ranges. All other higher levels have non-overlapping
+key ranges between the SSTables in the level. Each non-level-0 level
+has a contiguous key range. When level-0 reaches a size threshold,
+the SSTable les are picked and merged with sstables from the
+level-1 and the overlapping key range from the level-1 is replaced
+with new SSTable les. This involves a k-way merge sort between
+the source SSTable les. A similar process is followed to manage
+the size of each level according to the size threshold.
+Due to the compactions that periodically rewrite the data, LSM
+Trees can incur high write amplication. For an LSM Tree with a
+10x level multiplier, each level except the level-0 contributes a write
+amplication of 10. When data is ushed to level-0 from the write
+cache, it contributes to a write amplication of 1. Similarly, the
+write-ahead log also contributes a write amplication of 1. Hence,
+for an LSM Tree with 5 levels, the worst-case write amplication
+can go up to 42. For skewed workloads, observed write amplication
+will be lower than the worst-case amplication.
+2.3.3 Read Operation. The levels in the LSM Tree hold data in
+the order of recency. The lower levels have the most recent data.
+When a lookup operation needs to be performed, the read starts
+looking up the key from the in-memory component. If it nds the
+key in the in-memory component, it can return immediately as it
+contains the most recent version of the record. Otherwise, it keeps
+looking for the key in each next higher level. It has to go through
+every SSTable in the level-0 and one SSTable each from each of
+the other levels. Each SSTable has an immutable B+Tree incurring
+;>6⌫ (=) lookup cost (read amplication) where n is the number of
+items in the SSTable. This can be expensive in terms of CPU andI/O
+operations.
+To optimize the lookup, LSM Trees generally maintain a bloom
+lter per SSTable with high accuracy. This avoids I/O reads from
+SSTables which do not have the key. Using a bloom-lter with high
+accuracy, it can service the lookup operation using a single SSTable
+or a single B+Tree. This makes the cost of lookup similar to that of
+a traditional B+Tree
